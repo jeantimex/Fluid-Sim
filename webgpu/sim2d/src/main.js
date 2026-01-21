@@ -1,24 +1,29 @@
 import './style.css'
-import javascriptLogo from './javascript.svg'
-import viteLogo from '/vite.svg'
-import { setupCounter } from './counter.js'
+import { sim2dConfig } from './sim2dConfig.js'
 
-document.querySelector('#app').innerHTML = `
-  <div>
-    <a href="https://vite.dev" target="_blank">
-      <img src="${viteLogo}" class="logo" alt="Vite logo" />
-    </a>
-    <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript" target="_blank">
-      <img src="${javascriptLogo}" class="logo vanilla" alt="JavaScript logo" />
-    </a>
-    <h1>Hello Vite!</h1>
-    <div class="card">
-      <button id="counter" type="button"></button>
-    </div>
-    <p class="read-the-docs">
-      Click on the Vite logo to learn more
-    </p>
-  </div>
-`
+const app = document.querySelector('#app')
+const canvas = document.createElement('canvas')
+const ctx = canvas.getContext('2d')
+canvas.className = 'sim-canvas'
+app.appendChild(canvas)
 
-setupCounter(document.querySelector('#counter'))
+function resize() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1)
+  const width = window.innerWidth
+  const height = window.innerHeight
+  canvas.width = Math.floor(width * dpr)
+  canvas.height = Math.floor(height * dpr)
+  canvas.style.width = `${width}px`
+  canvas.style.height = `${height}px`
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+}
+
+function frame() {
+  ctx.fillStyle = sim2dConfig.render.clearColor
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  requestAnimationFrame(frame)
+}
+
+window.addEventListener('resize', resize)
+resize()
+frame()
