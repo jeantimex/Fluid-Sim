@@ -2,6 +2,10 @@ import './style.css'
 import { sim2dConfig } from './sim2dConfig.js'
 
 const app = document.querySelector('#app')
+const gpuCanvas = document.createElement('canvas')
+gpuCanvas.className = 'gpu-canvas'
+app.appendChild(gpuCanvas)
+
 const canvas = document.createElement('canvas')
 const ctx = canvas.getContext('2d')
 canvas.className = 'sim-canvas'
@@ -13,7 +17,25 @@ const state = {
   viewSize: { width: 0, height: 0 },
   gpuStatus: 'init',
   gpuDevice: null,
+  gpuContext: null,
+  gpuFormat: null,
+  gpuClearColor: { r: 0, g: 0, b: 0, a: 1 },
 }
+
+function parseHexColor(hex) {
+  const value = hex.trim()
+  const match = /^#([0-9a-fA-F]{6})$/.exec(value)
+  if (!match) return { r: 0, g: 0, b: 0, a: 1 }
+  const intValue = Number.parseInt(match[1], 16)
+  return {
+    r: ((intValue >> 16) & 255) / 255,
+    g: ((intValue >> 8) & 255) / 255,
+    b: (intValue & 255) / 255,
+    a: 1,
+  }
+}
+
+state.gpuClearColor = parseHexColor(sim2dConfig.render.clearColor)
 
 function createRng(seed) {
   let t = seed >>> 0
@@ -166,6 +188,15 @@ function drawOverlay() {
   ctx.fillText(`webgpu: ${state.gpuStatus}`, 12, 28)
 }
 
+function configureWebGPU() {
+  if (!state.gpuDevice || !state.gpuContext || !state.gpuFormat) return
+  state.gpuContext.configure({
+    device: state.gpuDevice,
+    format: state.gpuFormat,
+    alphaMode: 'opaque',
+  })
+}
+
 async function initWebGPU() {
   if (!('gpu' in navigator)) {
     state.gpuStatus = 'unsupported'
@@ -179,6 +210,9 @@ async function initWebGPU() {
   }
 
   state.gpuDevice = await adapter.requestDevice()
+  state.gpuContext = gpuCanvas.getContext('webgpu')
+  state.gpuFormat = navigator.gpu.getPreferredCanvasFormat()
+  configureWebGPU()
   state.gpuStatus = 'ready'
 }
 
@@ -186,6 +220,10 @@ function resize() {
   const dpr = Math.max(1, window.devicePixelRatio || 1)
   const width = window.innerWidth
   const height = window.innerHeight
+  gpuCanvas.width = Math.floor(width * dpr)
+  gpuCanvas.height = Math.floor(height * dpr)
+  gpuCanvas.style.width = `${width}px`
+  gpuCanvas.style.height = `${height}px`
   canvas.width = Math.floor(width * dpr)
   canvas.height = Math.floor(height * dpr)
   canvas.style.width = `${width}px`
@@ -193,9 +231,25 @@ function resize() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   state.viewSize.width = width
   state.viewSize.height = height
+  configureWebGPU()
 }
 
 function frame() {
+  if (state.gpuDevice && state.gpuContext) {
+    const encoder = state.gpuDevice.createCommandEncoder()
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: state.gpuContext.getCurrentTexture().createView(),
+          clearValue: state.gpuClearColor,
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    })
+    pass.end()
+    state.gpuDevice.queue.submit([encoder.finish()])
+  }
   ctx.fillStyle = sim2dConfig.render.clearColor
   ctx.fillRect(0, 0, state.viewSize.width, state.viewSize.height)
   drawParticles()
