@@ -23,12 +23,21 @@ const state = {
   gpuPipeline: null,
   gpuBindGroup: null,
   gpuPositionBuffer: null,
+  gpuPredictedPositionBuffer: null,
   gpuUniformBuffer: null,
   gpuVertexBuffer: null,
   gpuComputePipeline: null,
+  gpuUpdatePipeline: null,
   gpuComputeBindGroup: null,
   gpuVelocityBuffer: null,
   gpuComputeUniformBuffer: null,
+  gpuSpatialKeysBuffer: null,
+  gpuSpatialOffsetsBuffer: null,
+  gpuSortedIndicesBuffer: null,
+  gpuSpatialPipeline: null,
+  gpuSpatialBindGroup: null,
+  gpuSpatialUniformBuffer: null,
+  gpuSpatialReady: false,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -234,6 +243,11 @@ function initGpuResources() {
   })
   device.queue.writeBuffer(state.gpuPositionBuffer, 0, positionsData)
 
+  state.gpuPredictedPositionBuffer = device.createBuffer({
+    size: positionsData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+
   state.gpuUniformBuffer = device.createBuffer({
     size: 16 * 4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -335,54 +349,84 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
   })
   device.queue.writeBuffer(state.gpuVelocityBuffer, 0, velocityData)
 
+  state.gpuSpatialKeysBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  state.gpuSpatialOffsetsBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  state.gpuSortedIndicesBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+
+  state.gpuSpatialUniformBuffer = device.createBuffer({
+    size: 8 * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  })
+
   state.gpuComputeUniformBuffer = device.createBuffer({
-    size: 12 * 4,
+    size: 16 * 4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   })
 
   const computeShader = device.createShaderModule({
     code: `
 struct ComputeUniforms {
-  deltaTime: f32,
-  gravity: f32,
-  collisionDamping: f32,
-  _pad0: f32,
+  simParams: vec4<f32>,
   boundsSize: vec2<f32>,
+  _pad0: vec2<f32>,
   obstacleSize: vec2<f32>,
   obstacleCenter: vec2<f32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
-@group(0) @binding(1) var<storage, read_write> velocities: array<vec2<f32>>;
-@group(0) @binding(2) var<uniform> uniforms: ComputeUniforms;
+@group(0) @binding(1) var<storage, read_write> predicted: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> velocities: array<vec2<f32>>;
+@group(0) @binding(3) var<uniform> uniforms: ComputeUniforms;
 
 @compute @workgroup_size(64)
-fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
+fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x;
   if (i >= arrayLength(&positions)) { return; }
+  let deltaTime = uniforms.simParams.x;
+  let gravity = uniforms.simParams.y;
+  let predictionFactor = uniforms.simParams.w;
   var v = velocities[i];
-  v = v + vec2<f32>(0.0, uniforms.gravity) * uniforms.deltaTime;
+  v = v + vec2<f32>(0.0, gravity) * deltaTime;
   velocities[i] = v;
-  var p = positions[i] + v * uniforms.deltaTime;
+  predicted[i] = positions[i] + v * predictionFactor;
+}
+
+@compute @workgroup_size(64)
+fn updatePositions(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= arrayLength(&positions)) { return; }
+  let deltaTime = uniforms.simParams.x;
+  let collisionDamping = uniforms.simParams.z;
+  var v = velocities[i];
+  var p = positions[i] + v * deltaTime;
   let halfSize = uniforms.boundsSize * 0.5;
   let edgeDst = halfSize - abs(p);
   if (edgeDst.x <= 0.0) {
     p.x = halfSize.x * sign(p.x);
-    v.x = -v.x * uniforms.collisionDamping;
+    v.x = -v.x * collisionDamping;
   }
   if (edgeDst.y <= 0.0) {
     p.y = halfSize.y * sign(p.y);
-    v.y = -v.y * uniforms.collisionDamping;
+    v.y = -v.y * collisionDamping;
   }
   let obstacleHalf = uniforms.obstacleSize * 0.5;
   let obstacleDst = obstacleHalf - abs(p - uniforms.obstacleCenter);
   if (obstacleDst.x >= 0.0 && obstacleDst.y >= 0.0) {
     if (obstacleDst.x < obstacleDst.y) {
       p.x = obstacleHalf.x * sign(p.x - uniforms.obstacleCenter.x) + uniforms.obstacleCenter.x;
-      v.x = -v.x * uniforms.collisionDamping;
+      v.x = -v.x * collisionDamping;
     } else {
       p.y = obstacleHalf.y * sign(p.y - uniforms.obstacleCenter.y) + uniforms.obstacleCenter.y;
-      v.y = -v.y * uniforms.collisionDamping;
+      v.y = -v.y * collisionDamping;
     }
   }
   positions[i] = p;
@@ -391,21 +435,128 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
 `,
   })
 
+  const computeBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const computePipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [computeBindGroupLayout],
+  })
+
   state.gpuComputePipeline = device.createComputePipeline({
-    layout: 'auto',
+    layout: computePipelineLayout,
     compute: {
       module: computeShader,
-      entryPoint: 'csMain',
+      entryPoint: 'externalForces',
+    },
+  })
+
+  state.gpuUpdatePipeline = device.createComputePipeline({
+    layout: computePipelineLayout,
+    compute: {
+      module: computeShader,
+      entryPoint: 'updatePositions',
     },
   })
 
   state.gpuComputeBindGroup = device.createBindGroup({
-    layout: state.gpuComputePipeline.getBindGroupLayout(0),
+    layout: computeBindGroupLayout,
     entries: [
       { binding: 0, resource: { buffer: state.gpuPositionBuffer } },
-      { binding: 1, resource: { buffer: state.gpuVelocityBuffer } },
-      { binding: 2, resource: { buffer: state.gpuComputeUniformBuffer } },
+      { binding: 1, resource: { buffer: state.gpuPredictedPositionBuffer } },
+      { binding: 2, resource: { buffer: state.gpuVelocityBuffer } },
+      { binding: 3, resource: { buffer: state.gpuComputeUniformBuffer } },
     ],
+  })
+
+  device.pushErrorScope('validation')
+
+  const spatialShader = device.createShaderModule({
+    code: `
+struct SpatialUniforms {
+  smoothingRadius: f32,
+  numParticles: f32,
+  _pad: vec2<f32>,
+};
+
+@group(0) @binding(0) var<storage, read> predicted: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(2) var<uniform> uniforms: SpatialUniforms;
+
+const hashK1: u32 = 15823u;
+const hashK2: u32 = 9737333u;
+
+fn getCell2D(position: vec2<f32>, radius: f32) -> vec2<i32> {
+  return vec2<i32>(
+    i32(floor(position.x / radius)),
+    i32(floor(position.y / radius))
+  );
+}
+
+fn hashCell2D(cell: vec2<i32>) -> u32 {
+  let ux = u32(cell.x);
+  let uy = u32(cell.y);
+  let a = ux * hashK1;
+  let b = uy * hashK2;
+  return a + b;
+}
+
+@compute @workgroup_size(64)
+fn updateSpatialHash(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (f32(i) >= uniforms.numParticles) { return; }
+  let cell = getCell2D(predicted[i], uniforms.smoothingRadius);
+  let hash = hashCell2D(cell);
+  let count = u32(uniforms.numParticles);
+  keys[i] = hash % count;
+}
+`,
+  })
+
+  const spatialBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const spatialPipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [spatialBindGroupLayout],
+  })
+
+  state.gpuSpatialPipeline = device.createComputePipeline({
+    layout: spatialPipelineLayout,
+    compute: {
+      module: spatialShader,
+      entryPoint: 'updateSpatialHash',
+    },
+  })
+
+  state.gpuSpatialBindGroup = device.createBindGroup({
+    layout: spatialBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuPredictedPositionBuffer } },
+      { binding: 1, resource: { buffer: state.gpuSpatialKeysBuffer } },
+      { binding: 2, resource: { buffer: state.gpuSpatialUniformBuffer } },
+    ],
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.gpuSpatialPipeline = null
+      state.gpuSpatialBindGroup = null
+      state.gpuSpatialReady = false
+    } else {
+      state.gpuSpatialReady = true
+    }
   })
 
   device.popErrorScope().then((error) => {
@@ -496,18 +647,28 @@ function updateGpuUniforms() {
 
 function updateComputeUniforms() {
   if (!state.gpuDevice || !state.gpuComputeUniformBuffer) return
-  const data = new Float32Array(12)
+  const data = new Float32Array(16)
   data[0] = 1 / 60
   data[1] = sim2dConfig.sim.gravity
   data[2] = sim2dConfig.sim.collisionDamping
-  data[3] = 0
+  data[3] = 1 / 120
   data[4] = sim2dConfig.sim.boundsSize[0]
   data[5] = sim2dConfig.sim.boundsSize[1]
-  data[6] = sim2dConfig.sim.obstacleSize[0]
-  data[7] = sim2dConfig.sim.obstacleSize[1]
-  data[8] = sim2dConfig.sim.obstacleCenter[0]
-  data[9] = sim2dConfig.sim.obstacleCenter[1]
+  data[6] = 0
+  data[7] = 0
+  data[8] = sim2dConfig.sim.obstacleSize[0]
+  data[9] = sim2dConfig.sim.obstacleSize[1]
+  data[10] = sim2dConfig.sim.obstacleCenter[0]
+  data[11] = sim2dConfig.sim.obstacleCenter[1]
   state.gpuDevice.queue.writeBuffer(state.gpuComputeUniformBuffer, 0, data)
+}
+
+function updateSpatialUniforms() {
+  if (!state.gpuDevice || !state.gpuSpatialUniformBuffer) return
+  const data = new Float32Array(4)
+  data[0] = sim2dConfig.sim.smoothingRadius
+  data[1] = state.positions.length
+  state.gpuDevice.queue.writeBuffer(state.gpuSpatialUniformBuffer, 0, data)
 }
 
 function frame() {
@@ -515,6 +676,7 @@ function frame() {
   if (useGpu) {
     updateGpuUniforms()
     updateComputeUniforms()
+    updateSpatialUniforms()
     if (state.gpuCheckPending) {
       state.gpuDevice.pushErrorScope('validation')
     }
@@ -525,6 +687,16 @@ function frame() {
       computePass.setBindGroup(0, state.gpuComputeBindGroup)
       const workgroupCount = Math.ceil(state.positions.length / 64)
       computePass.dispatchWorkgroups(workgroupCount)
+      if (state.gpuSpatialReady && state.gpuSpatialPipeline && state.gpuSpatialBindGroup) {
+        computePass.setPipeline(state.gpuSpatialPipeline)
+        computePass.setBindGroup(0, state.gpuSpatialBindGroup)
+        computePass.dispatchWorkgroups(workgroupCount)
+      }
+      if (state.gpuUpdatePipeline) {
+        computePass.setPipeline(state.gpuUpdatePipeline)
+        computePass.setBindGroup(0, state.gpuComputeBindGroup)
+        computePass.dispatchWorkgroups(workgroupCount)
+      }
       computePass.end()
     }
     const pass = encoder.beginRenderPass({
