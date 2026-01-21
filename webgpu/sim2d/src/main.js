@@ -46,6 +46,14 @@ const state = {
   gpuScanCombinePipeline: null,
   gpuScanReady: false,
   gpuScanCheckPending: true,
+  gpuCountSortPipeline: null,
+  gpuCountSortScatterPipeline: null,
+  gpuCountSortCopyPipeline: null,
+  gpuCountSortClearPipeline: null,
+  gpuCountSortBindGroup: null,
+  gpuCountSortReady: false,
+  gpuCountSortTempItemsBuffer: null,
+  gpuCountSortTempKeysBuffer: null,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -369,6 +377,14 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
     size: state.positions.length * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   })
+  state.gpuCountSortTempItemsBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  state.gpuCountSortTempKeysBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
 
   state.gpuSpatialUniformBuffer = device.createBuffer({
     size: 8 * 4,
@@ -599,7 +615,7 @@ struct ScanUniforms {
   _pad: vec3<u32>,
 };
 
-@group(0) @binding(0) var<storage, read_write> elements: array<u32>;
+@group(0) @binding(0) var<storage, read_write> elements: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write> groupSums: array<u32>;
 @group(0) @binding(2) var<uniform> uniforms: ScanUniforms;
 
@@ -624,8 +640,8 @@ fn blockScan(
   let hasA = globalA < uniforms.itemCount;
   let hasB = globalB < uniforms.itemCount;
 
-  temp[localA] = select(0u, elements[globalA], hasA);
-  temp[localB] = select(0u, elements[globalB], hasB);
+  temp[localA] = select(0u, atomicLoad(&elements[globalA]), hasA);
+  temp[localB] = select(0u, atomicLoad(&elements[globalB]), hasB);
 
   var offset = 1u;
   for (var numActive = GROUP_SIZE; numActive > 0u; numActive = numActive / 2u) {
@@ -656,8 +672,8 @@ fn blockScan(
   }
 
   workgroupBarrier();
-  if (hasA) { elements[globalA] = temp[localA]; }
-  if (hasB) { elements[globalB] = temp[localB]; }
+  if (hasA) { atomicStore(&elements[globalA], temp[localA]); }
+  if (hasB) { atomicStore(&elements[globalB], temp[localB]); }
 }
 
 @compute @workgroup_size(256)
@@ -667,8 +683,14 @@ fn blockCombine(
 ) {
   let globalA = globalId.x * 2u;
   let globalB = globalA + 1u;
-  if (globalA < uniforms.itemCount) { elements[globalA] = elements[globalA] + groupSums[groupId.x]; }
-  if (globalB < uniforms.itemCount) { elements[globalB] = elements[globalB] + groupSums[groupId.x]; }
+  if (globalA < uniforms.itemCount) {
+    let v = atomicLoad(&elements[globalA]);
+    atomicStore(&elements[globalA], v + groupSums[groupId.x]);
+  }
+  if (globalB < uniforms.itemCount) {
+    let v = atomicLoad(&elements[globalB]);
+    atomicStore(&elements[globalB], v + groupSums[groupId.x]);
+  }
 }
 `,
   })
@@ -710,6 +732,134 @@ fn blockCombine(
       state.gpuScanReady = false
     } else {
       state.gpuScanReady = true
+    }
+  })
+
+  device.pushErrorScope('validation')
+
+  const countSortShader = device.createShaderModule({
+    code: `
+struct CountSortUniforms {
+  numInputs: u32,
+  _pad: vec3<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> inputItems: array<u32>;
+@group(0) @binding(1) var<storage, read_write> inputKeys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> sortedItems: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sortedKeys: array<u32>;
+@group(0) @binding(4) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(5) var<uniform> uniforms: CountSortUniforms;
+
+const GROUP_SIZE: u32 = 256u;
+
+@compute @workgroup_size(256)
+fn clearCounts(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  atomicStore(&counts[i], 0u);
+  inputItems[i] = i;
+}
+
+@compute @workgroup_size(256)
+fn calculateCounts(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  let key = inputKeys[i];
+  atomicAdd(&counts[key], 1u);
+}
+
+@compute @workgroup_size(256)
+fn scatterOutput(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  let key = inputKeys[i];
+  let sortedIndex = atomicAdd(&counts[key], 1u);
+  sortedItems[sortedIndex] = inputItems[i];
+  sortedKeys[sortedIndex] = key;
+}
+
+@compute @workgroup_size(256)
+fn copyBack(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  inputItems[i] = sortedItems[i];
+  inputKeys[i] = sortedKeys[i];
+}
+`,
+  })
+
+  const countSortBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const countSortPipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [countSortBindGroupLayout],
+  })
+
+  state.gpuCountSortClearPipeline = device.createComputePipeline({
+    layout: countSortPipelineLayout,
+    compute: {
+      module: countSortShader,
+      entryPoint: 'clearCounts',
+    },
+  })
+
+  state.gpuCountSortPipeline = device.createComputePipeline({
+    layout: countSortPipelineLayout,
+    compute: {
+      module: countSortShader,
+      entryPoint: 'calculateCounts',
+    },
+  })
+
+  state.gpuCountSortScatterPipeline = device.createComputePipeline({
+    layout: countSortPipelineLayout,
+    compute: {
+      module: countSortShader,
+      entryPoint: 'scatterOutput',
+    },
+  })
+
+  state.gpuCountSortCopyPipeline = device.createComputePipeline({
+    layout: countSortPipelineLayout,
+    compute: {
+      module: countSortShader,
+      entryPoint: 'copyBack',
+    },
+  })
+
+  state.gpuCountSortBindGroup = device.createBindGroup({
+    layout: countSortBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuSortedIndicesBuffer } },
+      { binding: 1, resource: { buffer: state.gpuSpatialKeysBuffer } },
+      { binding: 2, resource: { buffer: state.gpuCountSortTempItemsBuffer } },
+      { binding: 3, resource: { buffer: state.gpuCountSortTempKeysBuffer } },
+      { binding: 4, resource: { buffer: state.gpuCountBuffer } },
+      { binding: 5, resource: { buffer: state.gpuScanUniformBuffer } },
+    ],
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.gpuCountSortReady = false
+      state.gpuCountSortPipeline = null
+      state.gpuCountSortScatterPipeline = null
+      state.gpuCountSortCopyPipeline = null
+      state.gpuCountSortClearPipeline = null
+      state.gpuCountSortBindGroup = null
+    } else {
+      state.gpuCountSortReady = true
     }
   })
 
@@ -869,22 +1019,50 @@ function frame() {
       state.gpuScanCheckPending = false
     }
     if (state.gpuComputePipeline && state.gpuComputeBindGroup) {
+      const workgroupCount = Math.ceil(state.positions.length / 64)
+      const countSortGroups = Math.ceil(state.positions.length / 256)
+
       const computePass = encoder.beginComputePass()
       computePass.setPipeline(state.gpuComputePipeline)
       computePass.setBindGroup(0, state.gpuComputeBindGroup)
-      const workgroupCount = Math.ceil(state.positions.length / 64)
       computePass.dispatchWorkgroups(workgroupCount)
       if (state.gpuSpatialReady && state.gpuSpatialPipeline && state.gpuSpatialBindGroup) {
         computePass.setPipeline(state.gpuSpatialPipeline)
         computePass.setBindGroup(0, state.gpuSpatialBindGroup)
         computePass.dispatchWorkgroups(workgroupCount)
       }
-      if (state.gpuUpdatePipeline) {
-        computePass.setPipeline(state.gpuUpdatePipeline)
-        computePass.setBindGroup(0, state.gpuComputeBindGroup)
-        computePass.dispatchWorkgroups(workgroupCount)
+      if (state.gpuCountSortReady && state.gpuCountSortBindGroup) {
+        updateScanUniforms(state.positions.length)
+        computePass.setPipeline(state.gpuCountSortClearPipeline)
+        computePass.setBindGroup(0, state.gpuCountSortBindGroup)
+        computePass.dispatchWorkgroups(countSortGroups)
+
+        computePass.setPipeline(state.gpuCountSortPipeline)
+        computePass.setBindGroup(0, state.gpuCountSortBindGroup)
+        computePass.dispatchWorkgroups(countSortGroups)
       }
       computePass.end()
+
+      if (state.gpuCountSortReady && state.gpuCountSortBindGroup) {
+        runScanPass(encoder, state.gpuCountBuffer, state.gpuScanGroupSumsBuffer, state.positions.length)
+      }
+
+      const computePass2 = encoder.beginComputePass()
+      if (state.gpuCountSortReady && state.gpuCountSortBindGroup) {
+        computePass2.setPipeline(state.gpuCountSortScatterPipeline)
+        computePass2.setBindGroup(0, state.gpuCountSortBindGroup)
+        computePass2.dispatchWorkgroups(countSortGroups)
+
+        computePass2.setPipeline(state.gpuCountSortCopyPipeline)
+        computePass2.setBindGroup(0, state.gpuCountSortBindGroup)
+        computePass2.dispatchWorkgroups(countSortGroups)
+      }
+      if (state.gpuUpdatePipeline) {
+        computePass2.setPipeline(state.gpuUpdatePipeline)
+        computePass2.setBindGroup(0, state.gpuComputeBindGroup)
+        computePass2.dispatchWorkgroups(workgroupCount)
+      }
+      computePass2.end()
     }
     const pass = encoder.beginRenderPass({
       colorAttachments: [
