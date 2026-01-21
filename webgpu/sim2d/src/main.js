@@ -20,6 +20,14 @@ const state = {
   gpuContext: null,
   gpuFormat: null,
   gpuClearColor: { r: 0, g: 0, b: 0, a: 1 },
+  gpuPipeline: null,
+  gpuBindGroup: null,
+  gpuPositionBuffer: null,
+  gpuUniformBuffer: null,
+  gpuVertexBuffer: null,
+  gpuError: '',
+  useGpu: true,
+  gpuCheckPending: true,
 }
 
 function parseHexColor(hex) {
@@ -186,6 +194,143 @@ function drawOverlay() {
   ctx.textBaseline = 'top'
   ctx.fillText(`particles: ${state.positions.length}`, 12, 12)
   ctx.fillText(`webgpu: ${state.gpuStatus}`, 12, 28)
+  if (state.gpuError) {
+    ctx.fillText(state.gpuError, 12, 44)
+  }
+}
+
+function initGpuResources() {
+  const device = state.gpuDevice
+  if (!device) return
+
+  device.pushErrorScope('validation')
+
+  const quadVertices = new Float32Array([
+    -1, -1,
+    1, -1,
+    1, 1,
+    -1, -1,
+    1, 1,
+    -1, 1,
+  ])
+  state.gpuVertexBuffer = device.createBuffer({
+    size: quadVertices.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  })
+  device.queue.writeBuffer(state.gpuVertexBuffer, 0, quadVertices)
+
+  const positionsData = new Float32Array(state.positions.length * 2)
+  for (let i = 0; i < state.positions.length; i++) {
+    positionsData[i * 2] = state.positions[i][0]
+    positionsData[i * 2 + 1] = state.positions[i][1]
+  }
+  state.gpuPositionBuffer = device.createBuffer({
+    size: positionsData.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  })
+  device.queue.writeBuffer(state.gpuPositionBuffer, 0, positionsData)
+
+  state.gpuUniformBuffer = device.createBuffer({
+    size: 16 * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  })
+
+  const shader = device.createShaderModule({
+    code: `
+struct SimUniforms {
+  view: vec4<f32>,
+  color: vec4<f32>,
+  scale: f32,
+  _pad: vec3<f32>,
+};
+
+@group(0) @binding(0) var<uniform> uniforms: SimUniforms;
+
+struct VertexOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) local: vec2<f32>,
+};
+
+@vertex
+fn vsMain(@location(0) offset: vec2<f32>, @location(1) instancePos: vec2<f32>) -> VertexOut {
+  let pos = instancePos;
+  let world = pos + offset * uniforms.scale;
+  let clipX = (world.x - uniforms.view.x) / (uniforms.view.y - uniforms.view.x) * 2.0 - 1.0;
+  let clipY = (world.y - uniforms.view.z) / (uniforms.view.w - uniforms.view.z) * 2.0 - 1.0;
+  var out: VertexOut;
+  out.position = vec4<f32>(clipX, clipY, 0.0, 1.0);
+  out.local = offset;
+  return out;
+}
+
+@fragment
+fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
+  let dist = length(in.local);
+  let aa = fwidth(dist);
+  let alpha = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, dist);
+  return vec4<f32>(uniforms.color.rgb, uniforms.color.a * alpha);
+}
+`,
+  })
+
+  state.gpuPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: shader,
+      entryPoint: 'vsMain',
+      buffers: [
+        {
+          arrayStride: 8,
+          attributes: [{ shaderLocation: 0, format: 'float32x2', offset: 0 }],
+        },
+        {
+          arrayStride: 8,
+          stepMode: 'instance',
+          attributes: [{ shaderLocation: 1, format: 'float32x2', offset: 0 }],
+        },
+      ],
+    },
+    fragment: {
+      module: shader,
+      entryPoint: 'fsMain',
+      targets: [
+        {
+          format: state.gpuFormat,
+          blend: {
+            color: {
+              srcFactor: 'src-alpha',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+            alpha: {
+              srcFactor: 'one',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+          },
+        },
+      ],
+    },
+    primitive: {
+      topology: 'triangle-list',
+      cullMode: 'none',
+    },
+  })
+
+  state.gpuBindGroup = device.createBindGroup({
+    layout: state.gpuPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuUniformBuffer } },
+    ],
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.useGpu = false
+    }
+  })
 }
 
 function configureWebGPU() {
@@ -210,9 +355,20 @@ async function initWebGPU() {
   }
 
   state.gpuDevice = await adapter.requestDevice()
+  state.gpuDevice.addEventListener('uncapturederror', (event) => {
+    state.gpuStatus = 'error'
+    state.gpuError = event.error?.message ?? 'uncaptured error'
+    state.useGpu = false
+  })
+  state.gpuDevice.lost.then((info) => {
+    state.gpuStatus = 'lost'
+    state.gpuError = info?.message ?? 'device lost'
+    state.useGpu = false
+  })
   state.gpuContext = gpuCanvas.getContext('webgpu')
   state.gpuFormat = navigator.gpu.getPreferredCanvasFormat()
   configureWebGPU()
+  initGpuResources()
   state.gpuStatus = 'ready'
 }
 
@@ -234,8 +390,33 @@ function resize() {
   configureWebGPU()
 }
 
+function updateGpuUniforms() {
+  if (!state.gpuDevice || !state.gpuUniformBuffer) return
+  const view = buildView(state.viewSize)
+  const color = sim2dConfig.render.gradientStops[0]?.color ?? [1, 1, 1]
+  const data = new Float32Array(16)
+  data[0] = view.left
+  data[1] = view.right
+  data[2] = view.bottom
+  data[3] = view.top
+  data[4] = color[0]
+  data[5] = color[1]
+  data[6] = color[2]
+  data[7] = 1
+  data[8] = sim2dConfig.render.particleScale
+  data[9] = 0
+  data[10] = 0
+  data[11] = 0
+  state.gpuDevice.queue.writeBuffer(state.gpuUniformBuffer, 0, data)
+}
+
 function frame() {
-  if (state.gpuDevice && state.gpuContext) {
+  const useGpu = state.useGpu && state.gpuDevice && state.gpuContext && state.gpuPipeline
+  if (useGpu) {
+    updateGpuUniforms()
+    if (state.gpuCheckPending) {
+      state.gpuDevice.pushErrorScope('validation')
+    }
     const encoder = state.gpuDevice.createCommandEncoder()
     const pass = encoder.beginRenderPass({
       colorAttachments: [
@@ -247,12 +428,31 @@ function frame() {
         },
       ],
     })
+    pass.setPipeline(state.gpuPipeline)
+    pass.setBindGroup(0, state.gpuBindGroup)
+    pass.setVertexBuffer(0, state.gpuVertexBuffer)
+    pass.setVertexBuffer(1, state.gpuPositionBuffer)
+    pass.draw(6, state.positions.length, 0, 0)
     pass.end()
     state.gpuDevice.queue.submit([encoder.finish()])
+    if (state.gpuCheckPending) {
+      state.gpuDevice.popErrorScope().then((error) => {
+        if (error) {
+          state.gpuStatus = 'error'
+          state.gpuError = error.message
+          state.useGpu = false
+        }
+      })
+      state.gpuCheckPending = false
+    }
   }
-  ctx.fillStyle = sim2dConfig.render.clearColor
-  ctx.fillRect(0, 0, state.viewSize.width, state.viewSize.height)
-  drawParticles()
+  if (useGpu) {
+    ctx.clearRect(0, 0, state.viewSize.width, state.viewSize.height)
+  } else {
+    ctx.fillStyle = sim2dConfig.render.clearColor
+    ctx.fillRect(0, 0, state.viewSize.width, state.viewSize.height)
+    drawParticles()
+  }
   drawOverlay()
   requestAnimationFrame(frame)
 }
