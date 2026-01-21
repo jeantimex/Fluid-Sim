@@ -58,6 +58,10 @@ const state = {
   gpuOffsetsInitPipeline: null,
   gpuOffsetsBindGroup: null,
   gpuOffsetsReady: false,
+  gpuDensityBuffer: null,
+  gpuDensityPipeline: null,
+  gpuDensityBindGroup: null,
+  gpuDensityReady: false,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -379,6 +383,10 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
   })
   state.gpuSortedIndicesBuffer = device.createBuffer({
     size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  state.gpuDensityBuffer = device.createBuffer({
+    size: state.positions.length * 8,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   })
   state.gpuCountSortTempItemsBuffer = device.createBuffer({
@@ -950,6 +958,145 @@ fn calculateOffsets(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   })
 
+  device.pushErrorScope('validation')
+
+  const densityShader = device.createShaderModule({
+    code: `
+struct DensityUniforms {
+  smoothingRadius: f32,
+  numParticles: f32,
+  spiky3Factor: f32,
+  spiky2Factor: f32,
+};
+
+@group(0) @binding(0) var<storage, read> predicted: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> spatialKeys: array<u32>;
+@group(0) @binding(2) var<storage, read> spatialOffsets: array<u32>;
+@group(0) @binding(3) var<storage, read> sortedIndices: array<u32>;
+@group(0) @binding(4) var<storage, read_write> densities: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> uniforms: DensityUniforms;
+
+const hashK1: u32 = 15823u;
+const hashK2: u32 = 9737333u;
+
+fn getCell2D(position: vec2<f32>, radius: f32) -> vec2<i32> {
+  return vec2<i32>(
+    i32(floor(position.x / radius)),
+    i32(floor(position.y / radius))
+  );
+}
+
+fn hashCell2D(cell: vec2<i32>) -> u32 {
+  let ux = u32(cell.x);
+  let uy = u32(cell.y);
+  let a = ux * hashK1;
+  let b = uy * hashK2;
+  return a + b;
+}
+
+fn spikyPow2(dst: f32, radius: f32, factor: f32) -> f32 {
+  if (dst < radius) {
+    let v = radius - dst;
+    return v * v * factor;
+  }
+  return 0.0;
+}
+
+fn spikyPow3(dst: f32, radius: f32, factor: f32) -> f32 {
+  if (dst < radius) {
+    let v = radius - dst;
+    return v * v * v * factor;
+  }
+  return 0.0;
+}
+
+@compute @workgroup_size(64)
+fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (f32(i) >= uniforms.numParticles) { return; }
+  let pos = predicted[i];
+  let originCell = getCell2D(pos, uniforms.smoothingRadius);
+  let sqrRadius = uniforms.smoothingRadius * uniforms.smoothingRadius;
+  var density = 0.0;
+  var nearDensity = 0.0;
+
+  for (var oy = -1; oy <= 1; oy = oy + 1) {
+    for (var ox = -1; ox <= 1; ox = ox + 1) {
+      let cell = originCell + vec2<i32>(ox, oy);
+      let hash = hashCell2D(cell);
+      let count = u32(uniforms.numParticles);
+      let key = hash % count;
+      var currIndex = spatialOffsets[key];
+      loop {
+        if (currIndex >= count) { break; }
+        let neighbourIndex = currIndex;
+        currIndex = currIndex + 1u;
+        let neighbourKey = spatialKeys[neighbourIndex];
+        if (neighbourKey != key) { break; }
+        let neighbourParticle = sortedIndices[neighbourIndex];
+        let neighbourPos = predicted[neighbourParticle];
+        let offset = neighbourPos - pos;
+        let sqrDst = dot(offset, offset);
+        if (sqrDst > sqrRadius) { continue; }
+        let dst = sqrt(sqrDst);
+        density = density + spikyPow2(dst, uniforms.smoothingRadius, uniforms.spiky2Factor);
+        nearDensity = nearDensity + spikyPow3(dst, uniforms.smoothingRadius, uniforms.spiky3Factor);
+      }
+    }
+  }
+
+  densities[i] = vec2<f32>(density, nearDensity);
+}
+`,
+  })
+
+  const densityBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const densityPipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [densityBindGroupLayout],
+  })
+
+  state.gpuDensityPipeline = device.createComputePipeline({
+    layout: densityPipelineLayout,
+    compute: {
+      module: densityShader,
+      entryPoint: 'calculateDensities',
+    },
+  })
+
+  state.gpuDensityBindGroup = device.createBindGroup({
+    layout: densityBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuPredictedPositionBuffer } },
+      { binding: 1, resource: { buffer: state.gpuSpatialKeysBuffer } },
+      { binding: 2, resource: { buffer: state.gpuSpatialOffsetsBuffer } },
+      { binding: 3, resource: { buffer: state.gpuSortedIndicesBuffer } },
+      { binding: 4, resource: { buffer: state.gpuDensityBuffer } },
+      { binding: 5, resource: { buffer: state.gpuSpatialUniformBuffer } },
+    ],
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.gpuDensityReady = false
+      state.gpuDensityPipeline = null
+      state.gpuDensityBindGroup = null
+    } else {
+      state.gpuDensityReady = true
+    }
+  })
+
   device.popErrorScope().then((error) => {
     if (error) {
       state.gpuStatus = 'error'
@@ -1059,6 +1206,8 @@ function updateSpatialUniforms() {
   const data = new Float32Array(4)
   data[0] = sim2dConfig.sim.smoothingRadius
   data[1] = state.positions.length
+  data[2] = 10 / (Math.PI * Math.pow(sim2dConfig.sim.smoothingRadius, 5))
+  data[3] = 6 / (Math.PI * Math.pow(sim2dConfig.sim.smoothingRadius, 4))
   state.gpuDevice.queue.writeBuffer(state.gpuSpatialUniformBuffer, 0, data)
 }
 
@@ -1153,6 +1302,11 @@ function frame() {
         computePass2.setPipeline(state.gpuOffsetsPipeline)
         computePass2.setBindGroup(0, state.gpuOffsetsBindGroup)
         computePass2.dispatchWorkgroups(countSortGroups)
+      }
+      if (state.gpuDensityReady && state.gpuDensityBindGroup) {
+        computePass2.setPipeline(state.gpuDensityPipeline)
+        computePass2.setBindGroup(0, state.gpuDensityBindGroup)
+        computePass2.dispatchWorkgroups(workgroupCount)
       }
       if (state.gpuUpdatePipeline) {
         computePass2.setPipeline(state.gpuUpdatePipeline)
