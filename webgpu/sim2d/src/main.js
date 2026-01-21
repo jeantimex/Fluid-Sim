@@ -27,6 +27,8 @@ const state = {
   gpuVertexBuffer: null,
   gpuComputePipeline: null,
   gpuComputeBindGroup: null,
+  gpuVelocityBuffer: null,
+  gpuComputeUniformBuffer: null,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -326,15 +328,38 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
     ],
   })
 
+  const velocityData = new Float32Array(state.positions.length * 2)
+  state.gpuVelocityBuffer = device.createBuffer({
+    size: velocityData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  device.queue.writeBuffer(state.gpuVelocityBuffer, 0, velocityData)
+
+  state.gpuComputeUniformBuffer = device.createBuffer({
+    size: 4 * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  })
+
   const computeShader = device.createShaderModule({
     code: `
+struct ComputeUniforms {
+  deltaTime: f32,
+  gravity: f32,
+  _pad: vec2<f32>,
+};
+
 @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> uniforms: ComputeUniforms;
 
 @compute @workgroup_size(64)
 fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x;
   if (i >= arrayLength(&positions)) { return; }
-  positions[i] = positions[i];
+  var v = velocities[i];
+  v = v + vec2<f32>(0.0, uniforms.gravity) * uniforms.deltaTime;
+  velocities[i] = v;
+  positions[i] = positions[i] + v * uniforms.deltaTime;
 }
 `,
   })
@@ -351,6 +376,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
     layout: state.gpuComputePipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: state.gpuPositionBuffer } },
+      { binding: 1, resource: { buffer: state.gpuVelocityBuffer } },
+      { binding: 2, resource: { buffer: state.gpuComputeUniformBuffer } },
     ],
   })
 
@@ -440,10 +467,19 @@ function updateGpuUniforms() {
   state.gpuDevice.queue.writeBuffer(state.gpuUniformBuffer, 0, data)
 }
 
+function updateComputeUniforms() {
+  if (!state.gpuDevice || !state.gpuComputeUniformBuffer) return
+  const data = new Float32Array(4)
+  data[0] = 1 / 60
+  data[1] = sim2dConfig.sim.gravity
+  state.gpuDevice.queue.writeBuffer(state.gpuComputeUniformBuffer, 0, data)
+}
+
 function frame() {
   const useGpu = state.useGpu && state.gpuDevice && state.gpuContext && state.gpuPipeline
   if (useGpu) {
     updateGpuUniforms()
+    updateComputeUniforms()
     if (state.gpuCheckPending) {
       state.gpuDevice.pushErrorScope('validation')
     }
