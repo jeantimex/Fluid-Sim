@@ -11,6 +11,8 @@ const state = {
   positions: [],
   velocities: [],
   viewSize: { width: 0, height: 0 },
+  gpuStatus: 'init',
+  gpuDevice: null,
 }
 
 function createRng(seed) {
@@ -134,6 +136,52 @@ function drawParticles() {
   }
 }
 
+function drawOverlay() {
+  const size = state.viewSize
+  const view = buildView(size)
+  const bounds = sim2dConfig.sim.boundsSize
+  const halfBounds = [bounds[0] * 0.5, bounds[1] * 0.5]
+  const bottomLeft = worldToScreen([-halfBounds[0], -halfBounds[1]], view, size)
+  const topRight = worldToScreen([halfBounds[0], halfBounds[1]], view, size)
+  const width = topRight[0] - bottomLeft[0]
+  const height = bottomLeft[1] - topRight[1]
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'
+  ctx.lineWidth = 1
+  ctx.strokeRect(bottomLeft[0], topRight[1], width, height)
+
+  const origin = worldToScreen([0, 0], view, size)
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'
+  ctx.beginPath()
+  ctx.moveTo(0, origin[1])
+  ctx.lineTo(size.width, origin[1])
+  ctx.moveTo(origin[0], 0)
+  ctx.lineTo(origin[0], size.height)
+  ctx.stroke()
+
+  ctx.fillStyle = 'rgba(255,255,255,0.8)'
+  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
+  ctx.textBaseline = 'top'
+  ctx.fillText(`particles: ${state.positions.length}`, 12, 12)
+  ctx.fillText(`webgpu: ${state.gpuStatus}`, 12, 28)
+}
+
+async function initWebGPU() {
+  if (!('gpu' in navigator)) {
+    state.gpuStatus = 'unsupported'
+    return
+  }
+
+  const adapter = await navigator.gpu.requestAdapter()
+  if (!adapter) {
+    state.gpuStatus = 'no adapter'
+    return
+  }
+
+  state.gpuDevice = await adapter.requestDevice()
+  state.gpuStatus = 'ready'
+}
+
 function resize() {
   const dpr = Math.max(1, window.devicePixelRatio || 1)
   const width = window.innerWidth
@@ -151,10 +199,12 @@ function frame() {
   ctx.fillStyle = sim2dConfig.render.clearColor
   ctx.fillRect(0, 0, state.viewSize.width, state.viewSize.height)
   drawParticles()
+  drawOverlay()
   requestAnimationFrame(frame)
 }
 
 window.addEventListener('resize', resize)
 initParticles()
+initWebGPU()
 resize()
 frame()
