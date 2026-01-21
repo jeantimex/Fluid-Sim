@@ -54,6 +54,10 @@ const state = {
   gpuCountSortReady: false,
   gpuCountSortTempItemsBuffer: null,
   gpuCountSortTempKeysBuffer: null,
+  gpuOffsetsPipeline: null,
+  gpuOffsetsInitPipeline: null,
+  gpuOffsetsBindGroup: null,
+  gpuOffsetsReady: false,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -863,6 +867,89 @@ fn copyBack(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   })
 
+  device.pushErrorScope('validation')
+
+  const offsetsShader = device.createShaderModule({
+    code: `
+struct OffsetsUniforms {
+  numInputs: u32,
+  _pad: vec3<u32>,
+};
+
+@group(0) @binding(0) var<storage, read> sortedKeys: array<u32>;
+@group(0) @binding(1) var<storage, read_write> offsets: array<u32>;
+@group(0) @binding(2) var<uniform> uniforms: OffsetsUniforms;
+
+@compute @workgroup_size(256)
+fn initializeOffsets(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  offsets[i] = uniforms.numInputs;
+}
+
+@compute @workgroup_size(256)
+fn calculateOffsets(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= uniforms.numInputs) { return; }
+  let key = sortedKeys[i];
+  let keyPrev = select(uniforms.numInputs, sortedKeys[i - 1u], i > 0u);
+  if (key != keyPrev) {
+    offsets[key] = i;
+  }
+}
+`,
+  })
+
+  const offsetsBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const offsetsPipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [offsetsBindGroupLayout],
+  })
+
+  state.gpuOffsetsInitPipeline = device.createComputePipeline({
+    layout: offsetsPipelineLayout,
+    compute: {
+      module: offsetsShader,
+      entryPoint: 'initializeOffsets',
+    },
+  })
+
+  state.gpuOffsetsPipeline = device.createComputePipeline({
+    layout: offsetsPipelineLayout,
+    compute: {
+      module: offsetsShader,
+      entryPoint: 'calculateOffsets',
+    },
+  })
+
+  state.gpuOffsetsBindGroup = device.createBindGroup({
+    layout: offsetsBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuSpatialKeysBuffer } },
+      { binding: 1, resource: { buffer: state.gpuSpatialOffsetsBuffer } },
+      { binding: 2, resource: { buffer: state.gpuScanUniformBuffer } },
+    ],
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.gpuOffsetsReady = false
+      state.gpuOffsetsPipeline = null
+      state.gpuOffsetsInitPipeline = null
+      state.gpuOffsetsBindGroup = null
+    } else {
+      state.gpuOffsetsReady = true
+    }
+  })
+
   device.popErrorScope().then((error) => {
     if (error) {
       state.gpuStatus = 'error'
@@ -1055,6 +1142,16 @@ function frame() {
 
         computePass2.setPipeline(state.gpuCountSortCopyPipeline)
         computePass2.setBindGroup(0, state.gpuCountSortBindGroup)
+        computePass2.dispatchWorkgroups(countSortGroups)
+      }
+      if (state.gpuOffsetsReady && state.gpuOffsetsBindGroup) {
+        updateScanUniforms(state.positions.length)
+        computePass2.setPipeline(state.gpuOffsetsInitPipeline)
+        computePass2.setBindGroup(0, state.gpuOffsetsBindGroup)
+        computePass2.dispatchWorkgroups(countSortGroups)
+
+        computePass2.setPipeline(state.gpuOffsetsPipeline)
+        computePass2.setBindGroup(0, state.gpuOffsetsBindGroup)
         computePass2.dispatchWorkgroups(countSortGroups)
       }
       if (state.gpuUpdatePipeline) {
