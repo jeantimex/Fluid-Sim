@@ -38,6 +38,14 @@ const state = {
   gpuSpatialBindGroup: null,
   gpuSpatialUniformBuffer: null,
   gpuSpatialReady: false,
+  gpuCountBuffer: null,
+  gpuScanUniformBuffer: null,
+  gpuScanGroupSumsBuffer: null,
+  gpuScanGroupSumsBuffer2: null,
+  gpuScanPipeline: null,
+  gpuScanCombinePipeline: null,
+  gpuScanReady: false,
+  gpuScanCheckPending: true,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -367,6 +375,29 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   })
 
+  state.gpuCountBuffer = device.createBuffer({
+    size: state.positions.length * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  device.queue.writeBuffer(state.gpuCountBuffer, 0, new Uint32Array(state.positions.length))
+
+  const itemsPerGroup = 512
+  const numGroups = Math.ceil(state.positions.length / itemsPerGroup)
+  const numGroups2 = Math.ceil(numGroups / itemsPerGroup)
+  state.gpuScanGroupSumsBuffer = device.createBuffer({
+    size: Math.max(1, numGroups) * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+  state.gpuScanGroupSumsBuffer2 = device.createBuffer({
+    size: Math.max(1, numGroups2) * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+
+  state.gpuScanUniformBuffer = device.createBuffer({
+    size: 8 * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  })
+
   state.gpuComputeUniformBuffer = device.createBuffer({
     size: 16 * 4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -559,6 +590,129 @@ fn updateSpatialHash(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   })
 
+  device.pushErrorScope('validation')
+
+  const scanShader = device.createShaderModule({
+    code: `
+struct ScanUniforms {
+  itemCount: u32,
+  _pad: vec3<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> elements: array<u32>;
+@group(0) @binding(1) var<storage, read_write> groupSums: array<u32>;
+@group(0) @binding(2) var<uniform> uniforms: ScanUniforms;
+
+const GROUP_SIZE: u32 = 256u;
+const ITEMS_PER_GROUP: u32 = 512u;
+
+var<workgroup> temp: array<u32, 512>;
+
+@compute @workgroup_size(256)
+fn blockScan(
+  @builtin(global_invocation_id) globalId: vec3<u32>,
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) groupId: vec3<u32>
+) {
+  let threadLocal = localId.x;
+  let group = groupId.x;
+  let globalA = globalId.x * 2u;
+  let globalB = globalA + 1u;
+  let localA = threadLocal * 2u;
+  let localB = localA + 1u;
+
+  let hasA = globalA < uniforms.itemCount;
+  let hasB = globalB < uniforms.itemCount;
+
+  temp[localA] = select(0u, elements[globalA], hasA);
+  temp[localB] = select(0u, elements[globalB], hasB);
+
+  var offset = 1u;
+  for (var numActive = GROUP_SIZE; numActive > 0u; numActive = numActive / 2u) {
+    workgroupBarrier();
+    if (threadLocal < numActive) {
+      let indexA = offset * (localA + 1u) - 1u;
+      let indexB = offset * (localB + 1u) - 1u;
+      temp[indexB] = temp[indexA] + temp[indexB];
+    }
+    offset = offset * 2u;
+  }
+
+  if (threadLocal == 0u) {
+    groupSums[group] = temp[ITEMS_PER_GROUP - 1u];
+    temp[ITEMS_PER_GROUP - 1u] = 0u;
+  }
+
+  for (var numActive = 1u; numActive <= GROUP_SIZE; numActive = numActive * 2u) {
+    workgroupBarrier();
+    offset = offset / 2u;
+    if (threadLocal < numActive) {
+      let indexA = offset * (localA + 1u) - 1u;
+      let indexB = offset * (localB + 1u) - 1u;
+      let sum = temp[indexA] + temp[indexB];
+      temp[indexA] = temp[indexB];
+      temp[indexB] = sum;
+    }
+  }
+
+  workgroupBarrier();
+  if (hasA) { elements[globalA] = temp[localA]; }
+  if (hasB) { elements[globalB] = temp[localB]; }
+}
+
+@compute @workgroup_size(256)
+fn blockCombine(
+  @builtin(global_invocation_id) globalId: vec3<u32>,
+  @builtin(workgroup_id) groupId: vec3<u32>
+) {
+  let globalA = globalId.x * 2u;
+  let globalB = globalA + 1u;
+  if (globalA < uniforms.itemCount) { elements[globalA] = elements[globalA] + groupSums[groupId.x]; }
+  if (globalB < uniforms.itemCount) { elements[globalB] = elements[globalB] + groupSums[groupId.x]; }
+}
+`,
+  })
+
+  const scanBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  })
+
+  const scanPipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [scanBindGroupLayout],
+  })
+
+  state.gpuScanPipeline = device.createComputePipeline({
+    layout: scanPipelineLayout,
+    compute: {
+      module: scanShader,
+      entryPoint: 'blockScan',
+    },
+  })
+
+  state.gpuScanCombinePipeline = device.createComputePipeline({
+    layout: scanPipelineLayout,
+    compute: {
+      module: scanShader,
+      entryPoint: 'blockCombine',
+    },
+  })
+
+  device.popErrorScope().then((error) => {
+    if (error) {
+      state.gpuStatus = 'error'
+      state.gpuError = error.message
+      state.gpuScanPipeline = null
+      state.gpuScanCombinePipeline = null
+      state.gpuScanReady = false
+    } else {
+      state.gpuScanReady = true
+    }
+  })
+
   device.popErrorScope().then((error) => {
     if (error) {
       state.gpuStatus = 'error'
@@ -671,6 +825,35 @@ function updateSpatialUniforms() {
   state.gpuDevice.queue.writeBuffer(state.gpuSpatialUniformBuffer, 0, data)
 }
 
+function updateScanUniforms(itemCount) {
+  if (!state.gpuDevice || !state.gpuScanUniformBuffer) return
+  const data = new Uint32Array(4)
+  data[0] = itemCount
+  state.gpuDevice.queue.writeBuffer(state.gpuScanUniformBuffer, 0, data)
+}
+
+function runScanPass(encoder, elementsBuffer, groupSumsBuffer, itemCount) {
+  if (!state.gpuScanReady || !state.gpuScanPipeline || !state.gpuScanCombinePipeline) return
+  const bindGroup = state.gpuDevice.createBindGroup({
+    layout: state.gpuScanPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: elementsBuffer } },
+      { binding: 1, resource: { buffer: groupSumsBuffer } },
+      { binding: 2, resource: { buffer: state.gpuScanUniformBuffer } },
+    ],
+  })
+  const workgroupCount = Math.ceil(itemCount / 512)
+  const pass = encoder.beginComputePass()
+  updateScanUniforms(itemCount)
+  pass.setPipeline(state.gpuScanPipeline)
+  pass.setBindGroup(0, bindGroup)
+  pass.dispatchWorkgroups(workgroupCount)
+  pass.setPipeline(state.gpuScanCombinePipeline)
+  pass.setBindGroup(0, bindGroup)
+  pass.dispatchWorkgroups(workgroupCount)
+  pass.end()
+}
+
 function frame() {
   const useGpu = state.useGpu && state.gpuDevice && state.gpuContext && state.gpuPipeline
   if (useGpu) {
@@ -681,6 +864,10 @@ function frame() {
       state.gpuDevice.pushErrorScope('validation')
     }
     const encoder = state.gpuDevice.createCommandEncoder()
+    if (state.gpuScanCheckPending && state.gpuScanReady) {
+      runScanPass(encoder, state.gpuCountBuffer, state.gpuScanGroupSumsBuffer, state.positions.length)
+      state.gpuScanCheckPending = false
+    }
     if (state.gpuComputePipeline && state.gpuComputeBindGroup) {
       const computePass = encoder.beginComputePass()
       computePass.setPipeline(state.gpuComputePipeline)
