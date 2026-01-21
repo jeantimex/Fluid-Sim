@@ -25,6 +25,8 @@ const state = {
   gpuPositionBuffer: null,
   gpuUniformBuffer: null,
   gpuVertexBuffer: null,
+  gpuComputePipeline: null,
+  gpuComputeBindGroup: null,
   gpuError: '',
   useGpu: true,
   gpuCheckPending: true,
@@ -226,7 +228,7 @@ function initGpuResources() {
   }
   state.gpuPositionBuffer = device.createBuffer({
     size: positionsData.byteLength,
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   })
   device.queue.writeBuffer(state.gpuPositionBuffer, 0, positionsData)
 
@@ -235,7 +237,7 @@ function initGpuResources() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   })
 
-  const shader = device.createShaderModule({
+  const renderShader = device.createShaderModule({
     code: `
 struct SimUniforms {
   view: vec4<f32>,
@@ -276,7 +278,7 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
   state.gpuPipeline = device.createRenderPipeline({
     layout: 'auto',
     vertex: {
-      module: shader,
+      module: renderShader,
       entryPoint: 'vsMain',
       buffers: [
         {
@@ -291,7 +293,7 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
       ],
     },
     fragment: {
-      module: shader,
+      module: renderShader,
       entryPoint: 'fsMain',
       targets: [
         {
@@ -321,6 +323,34 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
     layout: state.gpuPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: state.gpuUniformBuffer } },
+    ],
+  })
+
+  const computeShader = device.createShaderModule({
+    code: `
+@group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+
+@compute @workgroup_size(64)
+fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= arrayLength(&positions)) { return; }
+  positions[i] = positions[i];
+}
+`,
+  })
+
+  state.gpuComputePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: computeShader,
+      entryPoint: 'csMain',
+    },
+  })
+
+  state.gpuComputeBindGroup = device.createBindGroup({
+    layout: state.gpuComputePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: state.gpuPositionBuffer } },
     ],
   })
 
@@ -418,6 +448,14 @@ function frame() {
       state.gpuDevice.pushErrorScope('validation')
     }
     const encoder = state.gpuDevice.createCommandEncoder()
+    if (state.gpuComputePipeline && state.gpuComputeBindGroup) {
+      const computePass = encoder.beginComputePass()
+      computePass.setPipeline(state.gpuComputePipeline)
+      computePass.setBindGroup(0, state.gpuComputeBindGroup)
+      const workgroupCount = Math.ceil(state.positions.length / 64)
+      computePass.dispatchWorkgroups(workgroupCount)
+      computePass.end()
+    }
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
