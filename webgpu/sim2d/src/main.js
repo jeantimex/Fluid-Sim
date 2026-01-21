@@ -336,7 +336,7 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
   device.queue.writeBuffer(state.gpuVelocityBuffer, 0, velocityData)
 
   state.gpuComputeUniformBuffer = device.createBuffer({
-    size: 4 * 4,
+    size: 8 * 4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   })
 
@@ -345,7 +345,9 @@ fn fsMain(in: VertexOut) -> @location(0) vec4<f32> {
 struct ComputeUniforms {
   deltaTime: f32,
   gravity: f32,
-  _pad: vec2<f32>,
+  collisionDamping: f32,
+  _pad0: f32,
+  boundsSize: vec2<f32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
@@ -359,7 +361,19 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   var v = velocities[i];
   v = v + vec2<f32>(0.0, uniforms.gravity) * uniforms.deltaTime;
   velocities[i] = v;
-  positions[i] = positions[i] + v * uniforms.deltaTime;
+  var p = positions[i] + v * uniforms.deltaTime;
+  let halfSize = uniforms.boundsSize * 0.5;
+  let edgeDst = halfSize - abs(p);
+  if (edgeDst.x <= 0.0) {
+    p.x = halfSize.x * sign(p.x);
+    v.x = -v.x * uniforms.collisionDamping;
+  }
+  if (edgeDst.y <= 0.0) {
+    p.y = halfSize.y * sign(p.y);
+    v.y = -v.y * uniforms.collisionDamping;
+  }
+  positions[i] = p;
+  velocities[i] = v;
 }
 `,
   })
@@ -469,9 +483,13 @@ function updateGpuUniforms() {
 
 function updateComputeUniforms() {
   if (!state.gpuDevice || !state.gpuComputeUniformBuffer) return
-  const data = new Float32Array(4)
+  const data = new Float32Array(8)
   data[0] = 1 / 60
   data[1] = sim2dConfig.sim.gravity
+  data[2] = sim2dConfig.sim.collisionDamping
+  data[3] = 0
+  data[4] = sim2dConfig.sim.boundsSize[0]
+  data[5] = sim2dConfig.sim.boundsSize[1]
   state.gpuDevice.queue.writeBuffer(state.gpuComputeUniformBuffer, 0, data)
 }
 
